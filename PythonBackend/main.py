@@ -9,6 +9,7 @@ import io
 import wave
 import os
 from google.oauth2 import service_account
+from google.cloud import texttospeech
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +21,7 @@ class LinguavaBackend:
         self.key_file_path = key_file_path
         self.location = location
         self.model = None
+        self.tts_client = None
         self.connected_clients = set()
         self.credentials = None
         
@@ -32,6 +34,9 @@ class LinguavaBackend:
             location=location,
             credentials=self.credentials
         )
+        
+        # Initialize Text-to-Speech client
+        self.tts_client = texttospeech.TextToSpeechClient(credentials=self.credentials)
         
     def _load_credentials(self):
         """Load service account credentials from key file"""
@@ -50,14 +55,30 @@ class LinguavaBackend:
             raise
         
     async def initialize_gemini(self):
-        """Initialize Gemini Live model"""
-        try:
-            # Use the latest available Gemini model for audio/text
-            self.model = GenerativeModel("gemini-2.0-flash-exp")
-            logger.info("Gemini model initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize Gemini model: {e}")
-            raise
+        """Initialize Gemini model with fallback options"""
+        model_options = [
+            "gemini-2.0-flash-exp",      # Experimental with latest features
+            "gemini-2.0-flash",          # Stable version
+            "gemini-2.5-flash",          # Newer model if available
+            "gemini-1.5-pro"             # Fallback option
+        ]
+        
+        for model_name in model_options:
+            try:
+                self.model = GenerativeModel(model_name)
+                logger.info(f"Successfully initialized model: {model_name}")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to initialize {model_name}: {e}")
+                continue
+        
+        # If all models fail
+        logger.error("Failed to initialize any Gemini model")
+        logger.error("Please ensure:")
+        logger.error("1. Vertex AI API is enabled in your Google Cloud project")
+        logger.error("2. Your service account has the necessary permissions")
+        logger.error("3. Your project has access to Gemini models")
+        raise RuntimeError("Could not initialize any Gemini model")
 
     def create_context_prompt(self, game_state: dict) -> str:
         """Create contextual prompt based on game state"""
@@ -65,26 +86,60 @@ class LinguavaBackend:
         target = game_state.get("target", {})
         world = game_state.get("world", {})
         
-        prompt = f"""You are a helpful language tutor in Minecraft. The player is learning and you should:
-1. Respond naturally and conversationally
-2. Help with language learning related to what they're doing in the game
-3. Keep responses concise but helpful
-4. Use the game context to make learning relevant
+        prompt = f"""You are a friendly, enthusiastic language tutor helping someone learn while playing Minecraft. Keep your responses:
 
-Current context:
-- Player position: {player.get('position', 'unknown')}
-- Health: {player.get('health', 'unknown')}/20
-- Held item: {player.get('heldItem', 'none')}
+- CONVERSATIONAL and natural (like talking to a friend)
+- SHORT (1-2 sentences max, speak naturally)
+- CONTEXTUAL to what they're doing in the game
+- ENCOURAGING and supportive
+- Try to teach the player the language they are learning. The user is learning Japanese. And already has a basic understanding of the language.
+
+Current game context:
+- Player health: {player.get('health', 'unknown')}/20, hunger: {player.get('hunger', 'unknown')}/20
+- Holding: {player.get('heldItem', 'nothing')}
 - Looking at: {target.get('id', 'nothing')} ({target.get('type', 'none')})
-- Biome: {world.get('biome', 'unknown')}
-- Time: {'night' if world.get('timeOfDay', 0) > 13000 else 'day'}
+- Environment: {world.get('biome', 'unknown').replace('minecraft:', '').replace('_', ' ')}
+- Time: {'night time' if world.get('timeOfDay', 0) > 13000 else 'day time'}
+- Weather: {'raining' if world.get('isRaining', False) else 'clear'}
 
-Respond naturally to what the player says while incorporating this game context."""
+Respond naturally to what they say, like you're right there with them playing the game. Keep it conversational and fun!"""
         
         return prompt
 
+    async def text_to_speech(self, text: str) -> bytes:
+        """Convert text to speech using Google Cloud TTS"""
+        try:
+            # Set up the synthesis input
+            synthesis_input = texttospeech.SynthesisInput(text=text)
+            
+            # Build the voice request - use a friendly, natural voice
+            voice = texttospeech.VoiceSelectionParams(
+                language_code="en-US",
+                name="en-US-Neural2-F",  # Female voice, sounds natural
+                ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+            )
+            
+            # Select the type of audio file
+            audio_config = texttospeech.AudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+                sample_rate_hertz=16000  # Match Minecraft mod's expected format
+            )
+            
+            # Perform the text-to-speech request
+            response = self.tts_client.synthesize_speech(
+                input=synthesis_input,
+                voice=voice,
+                audio_config=audio_config
+            )
+            
+            return response.audio_content
+            
+        except Exception as e:
+            logger.error(f"Error in text-to-speech: {e}")
+            return b""  # Return empty bytes if TTS fails
+
     async def process_audio_with_gemini(self, audio_data: bytes, context_prompt: str):
-        """Process audio with Gemini API"""
+        """Process audio with Gemini API and return both text and audio response"""
         try:
             # Create audio part for Gemini
             audio_part = Part.from_data(audio_data, mime_type="audio/wav")
@@ -97,12 +152,23 @@ Respond naturally to what the player says while incorporating this game context.
                 lambda: self.model.generate_content([context_prompt, audio_part])
             )
             
-            # Return text response
-            return response.text
+            # Get text response
+            text_response = response.text
+            
+            # Generate audio from text
+            audio_response = await self.text_to_speech(text_response)
+            
+            return {
+                "text": text_response,
+                "audio": audio_response
+            }
             
         except Exception as e:
             logger.error(f"Error processing with Gemini: {e}")
-            return "Sorry, I couldn't process that. Could you try again?"
+            return {
+                "text": "Sorry, I couldn't process that. Could you try again?",
+                "audio": await self.text_to_speech("Sorry, I couldn't process that. Could you try again?")
+            }
 
     def convert_pcm_to_wav(self, pcm_data: bytes, sample_rate: int = 16000, channels: int = 1, sample_width: int = 2) -> bytes:
         """Convert raw PCM data to WAV format"""
@@ -137,17 +203,18 @@ Respond naturally to what the player says while incorporating this game context.
                 context_prompt = self.create_context_prompt(data.get("gameState", {}))
                 
                 # Process with Gemini
-                response_text = await self.process_audio_with_gemini(wav_data, context_prompt)
+                response_data = await self.process_audio_with_gemini(wav_data, context_prompt)
                 
                 # Send response back to client
                 response = {
                     "type": "AI_RESPONSE",
-                    "text": response_text,
+                    "text": response_data["text"],
+                    "audioData": base64.b64encode(response_data["audio"]).decode('utf-8') if response_data["audio"] else "",
                     "timestamp": data.get("timestamp", 0)
                 }
                 
                 await websocket.send(json.dumps(response))
-                logger.info(f"Processed audio request, sent response: {response_text[:100]}...")
+                logger.info(f"Processed audio request, sent response: {response_data['text'][:100]}... (with audio: {len(response_data['audio'])} bytes)")
                 
             elif data.get("type") == "PING":
                 await websocket.send(json.dumps({"type": "PONG"}))
