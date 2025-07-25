@@ -8,24 +8,46 @@ from vertexai.generative_models import GenerativeModel, Part
 import io
 import wave
 import os
+import re
 from google.oauth2 import service_account
-from google.cloud import texttospeech
+import azure.cognitiveservices.speech as speechsdk
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class LinguavaBackend:
-    def __init__(self, project_id: str, key_file_path: str, location: str = "us-central1"):
+class EnhancedLinguavaBackend:
+    def __init__(self, project_id: str, key_file_path: str, azure_speech_key: str, azure_speech_region: str, location: str = "us-central1"):
+        # Configuration from environment variables
         self.project_id = project_id
         self.key_file_path = key_file_path
         self.location = location
         self.model = None
-        self.tts_client = None
         self.connected_clients = set()
         self.credentials = None
         
-        # Load credentials from key file
+        # Azure Speech configuration from environment
+        self.azure_speech_key = azure_speech_key
+        self.azure_speech_region = azure_speech_region
+        self.speech_config = None
+        
+        # Voice configuration for different languages
+        self.voices = {
+            "english": os.getenv("VOICE_ENGLISH", "en-US-AriaNeural"),
+            "japanese": os.getenv("VOICE_JAPANESE", "ja-JP-NanamiNeural"), 
+            "spanish": os.getenv("VOICE_SPANISH", "es-ES-ElviraNeural"),
+            "french": os.getenv("VOICE_FRENCH", "fr-FR-DeniseNeural"),
+            "chinese": os.getenv("VOICE_CHINESE", "zh-CN-XiaoxiaoNeural")
+        }
+        
+        # Target language for learning (configurable)
+        self.target_language = os.getenv("TARGET_LANGUAGE", "japanese").lower()
+        
+        # Load Google credentials from key file (for Vertex AI)
         self._load_credentials()
         
         # Initialize Vertex AI with credentials
@@ -35,8 +57,8 @@ class LinguavaBackend:
             credentials=self.credentials
         )
         
-        # Initialize Text-to-Speech client
-        self.tts_client = texttospeech.TextToSpeechClient(credentials=self.credentials)
+        # Initialize Azure Speech configuration
+        self._initialize_azure_speech()
         
     def _load_credentials(self):
         """Load service account credentials from key file"""
@@ -52,6 +74,28 @@ class LinguavaBackend:
             
         except Exception as e:
             logger.error(f"Failed to load credentials from {self.key_file_path}: {e}")
+            raise
+    
+    def _initialize_azure_speech(self):
+        """Initialize Azure Speech configuration"""
+        try:
+            self.speech_config = speechsdk.SpeechConfig(
+                subscription=self.azure_speech_key, 
+                region=self.azure_speech_region
+            )
+            
+            # Set default English voice
+            self.speech_config.speech_synthesis_voice_name = self.voices["english"]
+            
+            # Set audio format to match Minecraft mod expectations
+            self.speech_config.set_speech_synthesis_output_format(
+                speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm
+            )
+            
+            logger.info(f"Azure Speech initialized with voice: {self.speech_config.speech_synthesis_voice_name}")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize Azure Speech: {e}")
             raise
         
     async def initialize_gemini(self):
@@ -86,57 +130,148 @@ class LinguavaBackend:
         target = game_state.get("target", {})
         world = game_state.get("world", {})
         
-        prompt = f"""You are a friendly, enthusiastic language tutor helping someone learn while playing Minecraft. Keep your responses:
+        # Customize prompt based on target language
+        language_examples = {
+            "japanese": {
+                "name": "Japanese",
+                "examples": "stone is 'ishi' (ee-shee), wood is 'ki' (kee), water is 'mizu' (mee-zoo)",
+                "time_day": "day time (hiru)", 
+                "time_night": "night time (yoru)",
+                "weather_rain": "raining (ame)",
+                "weather_clear": "clear (hareta)"
+            },
+            "spanish": {
+                "name": "Spanish", 
+                "examples": "stone is 'piedra', wood is 'madera', water is 'agua'",
+                "time_day": "day time (día)",
+                "time_night": "night time (noche)", 
+                "weather_rain": "raining (lluvia)",
+                "weather_clear": "clear (despejado)"
+            },
+            "french": {
+                "name": "French",
+                "examples": "stone is 'pierre', wood is 'bois', water is 'eau'", 
+                "time_day": "day time (jour)",
+                "time_night": "night time (nuit)",
+                "weather_rain": "raining (pluie)", 
+                "weather_clear": "clear (clair)"
+            }
+        }
+        
+        lang_config = language_examples.get(self.target_language, language_examples["japanese"])
+        
+        prompt = f"""You are a friendly, enthusiastic language tutor helping someone learn {lang_config['name']} while playing Minecraft. 
 
-- CONVERSATIONAL and natural (like talking to a friend)
-- SHORT (1-2 sentences max, speak naturally)
-- CONTEXTUAL to what they're doing in the game
-- ENCOURAGING and supportive
-- Try to teach the player the language they are learning. The user is learning Japanese. And already has a basic understanding of the language.
+IMPORTANT GUIDELINES:
+- Keep responses SHORT (1-2 sentences max)
+- Be CONVERSATIONAL and natural
+- Mix English and {lang_config['name']} appropriately for learning
+- Use simple {lang_config['name']} words with English pronunciation guides
+- Include relevant {lang_config['name']} vocabulary for Minecraft items/actions
+- Be encouraging and supportive
 
-Current game context:
+CURRENT GAME CONTEXT:
 - Player health: {player.get('health', 'unknown')}/20, hunger: {player.get('hunger', 'unknown')}/20
 - Holding: {player.get('heldItem', 'nothing')}
 - Looking at: {target.get('id', 'nothing')} ({target.get('type', 'none')})
 - Environment: {world.get('biome', 'unknown').replace('minecraft:', '').replace('_', ' ')}
-- Time: {'night time' if world.get('timeOfDay', 0) > 13000 else 'day time'}
-- Weather: {'raining' if world.get('isRaining', False) else 'clear'}
+- Time: {lang_config['time_night'] if world.get('timeOfDay', 0) > 13000 else lang_config['time_day']}
+- Weather: {lang_config['weather_rain'] if world.get('isRaining', False) else lang_config['weather_clear']}
 
-Respond naturally to what they say, like you're right there with them playing the game. Keep it conversational and fun!"""
+RESPONSE FORMAT:
+- Start with natural English conversation
+- Include 1-2 relevant {lang_config['name']} words/phrases with pronunciation
+- Keep it contextual to their current activity
+- Example: "Nice stone! In {lang_config['name']}, {lang_config['examples'].split(',')[0]}. What are you building?"
+
+Respond naturally like you're playing alongside them!"""
         
         return prompt
 
-    async def text_to_speech(self, text: str) -> bytes:
-        """Convert text to speech using Google Cloud TTS"""
+    def detect_language_in_text(self, text: str) -> str:
+        """Detect primary language in response text"""
+        # Simple detection based on character patterns
+        japanese_chars = re.findall(r'[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]', text)
+        chinese_chars = re.findall(r'[\u4E00-\u9FFF]', text)
+        
+        if japanese_chars and len(japanese_chars) > 3:
+            return "japanese"
+        elif chinese_chars and len(chinese_chars) > 3:
+            return "chinese"
+        else:
+            return "english"
+
+    async def text_to_speech_smart(self, text: str) -> bytes:
+        """Convert text to speech with smart language detection and voice switching"""
         try:
-            # Set up the synthesis input
-            synthesis_input = texttospeech.SynthesisInput(text=text)
+            # Detect if text contains non-English content
+            detected_lang = self.detect_language_in_text(text)
             
-            # Build the voice request - use a friendly, natural voice
-            voice = texttospeech.VoiceSelectionParams(
-                language_code="en-US",
-                name="en-US-Neural2-F",  # Female voice, sounds natural
-                ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+            # Choose appropriate voice
+            voice_name = self.voices.get(detected_lang, self.voices["english"])
+            
+            # Create speech config
+            speech_config = speechsdk.SpeechConfig(
+                subscription=self.azure_speech_key,
+                region=self.azure_speech_region
             )
             
-            # Select the type of audio file
-            audio_config = texttospeech.AudioConfig(
-                audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-                sample_rate_hertz=16000  # Match Minecraft mod's expected format
-            )
-            
-            # Perform the text-to-speech request
-            response = self.tts_client.synthesize_speech(
-                input=synthesis_input,
-                voice=voice,
-                audio_config=audio_config
-            )
-            
-            return response.audio_content
-            
+            # For mixed language content, use SSML for better pronunciation
+            if detected_lang != "english" and any(char.isascii() and char.isalpha() for char in text):
+                # Mixed content - use SSML
+                ssml_text = self._create_mixed_language_ssml(text, voice_name)
+                return await self._synthesize_ssml(ssml_text, speech_config)
+            else:
+                # Single language - use regular synthesis
+                speech_config.speech_synthesis_voice_name = voice_name
+                speech_config.set_speech_synthesis_output_format(
+                    speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm
+                )
+                
+                synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
+                result = synthesizer.speak_text_async(text).get()
+                
+                if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                    return result.audio_data
+                else:
+                    logger.error(f"Speech synthesis failed: {result.reason}")
+                    return b""
+                
         except Exception as e:
-            logger.error(f"Error in text-to-speech: {e}")
-            return b""  # Return empty bytes if TTS fails
+            logger.error(f"Error in smart text-to-speech: {e}")
+            return b""
+
+    def _create_mixed_language_ssml(self, text: str, primary_voice: str) -> str:
+        """Create SSML for mixed language content"""
+        # Simple SSML wrapper - could be enhanced for better language detection
+        english_voice = self.voices["english"]
+        
+        ssml = f'''<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="en-US">
+    <voice name="{english_voice}">
+        {text}
+    </voice>
+</speak>'''
+        return ssml
+
+    async def _synthesize_ssml(self, ssml_text: str, speech_config) -> bytes:
+        """Synthesize SSML text"""
+        try:
+            speech_config.set_speech_synthesis_output_format(
+                speechsdk.SpeechSynthesisOutputFormat.Riff16Khz16BitMonoPcm
+            )
+            
+            synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
+            result = synthesizer.speak_ssml_async(ssml_text).get()
+            
+            if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                return result.audio_data
+            else:
+                logger.error(f"SSML synthesis failed: {result.reason}")
+                return b""
+                
+        except Exception as e:
+            logger.error(f"Error in SSML synthesis: {e}")
+            return b""
 
     async def process_audio_with_gemini(self, audio_data: bytes, context_prompt: str):
         """Process audio with Gemini API and return both text and audio response"""
@@ -155,8 +290,8 @@ Respond naturally to what they say, like you're right there with them playing th
             # Get text response
             text_response = response.text
             
-            # Generate audio from text
-            audio_response = await self.text_to_speech(text_response)
+            # Generate audio using smart language detection
+            audio_response = await self.text_to_speech_smart(text_response)
             
             return {
                 "text": text_response,
@@ -165,9 +300,10 @@ Respond naturally to what they say, like you're right there with them playing th
             
         except Exception as e:
             logger.error(f"Error processing with Gemini: {e}")
+            fallback_text = "Sorry, I couldn't process that. Sumimasen! (excuse me) Try again?"
             return {
-                "text": "Sorry, I couldn't process that. Could you try again?",
-                "audio": await self.text_to_speech("Sorry, I couldn't process that. Could you try again?")
+                "text": fallback_text,
+                "audio": await self.text_to_speech_smart(fallback_text)
             }
 
     def convert_pcm_to_wav(self, pcm_data: bytes, sample_rate: int = 16000, channels: int = 1, sample_width: int = 2) -> bytes:
@@ -252,28 +388,62 @@ Respond naturally to what they say, like you're right there with them playing th
         """Start the WebSocket server"""
         await self.initialize_gemini()
         
-        logger.info(f"Starting Linguava backend server on {host}:{port}")
+        logger.info(f"Starting Enhanced Linguava backend server on {host}:{port}")
+        logger.info(f"Available voices: {list(self.voices.keys())}")
         async with websockets.serve(self.handle_client, host, port):
             logger.info("Server started successfully")
             await asyncio.Future()  # Run forever
 
 async def main():
-    # Configuration - UPDATE THESE PATHS
-    PROJECT_ID = "linguava"  # Replace with your Google Cloud project ID
-    KEY_FILE_PATH = "./key.json"    # Path to your service account key file
+    """Main function that loads configuration from environment variables"""
     
-    # Validate configuration
-    if PROJECT_ID == "your-project-id":
-        logger.error("Please update PROJECT_ID in main.py with your actual Google Cloud project ID")
+    # Load configuration from environment variables
+    PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
+    KEY_FILE_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "./key.json")
+    AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
+    AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "eastus")
+    
+    # Validate required configuration
+    missing_vars = []
+    
+    if not PROJECT_ID:
+        missing_vars.append("GOOGLE_CLOUD_PROJECT")
+    
+    if not AZURE_SPEECH_KEY:
+        missing_vars.append("AZURE_SPEECH_KEY")
+    
+    if missing_vars:
+        logger.error("Missing required environment variables:")
+        for var in missing_vars:
+            logger.error(f"  - {var}")
+        logger.error("")
+        logger.error("Please create a .env file with the required variables.")
+        logger.error("See .env.example for reference.")
         return
     
+    # Check if key file exists
     if not os.path.exists(KEY_FILE_PATH):
-        logger.error(f"Key file not found: {KEY_FILE_PATH}")
-        logger.error("Please ensure your service account key file exists at the specified path")
+        logger.error(f"Google service account key file not found: {KEY_FILE_PATH}")
+        logger.error("Please ensure your Google service account key file exists")
+        logger.error("You can download it from Google Cloud Console → IAM & Admin → Service Accounts")
         return
     
-    backend = LinguavaBackend(PROJECT_ID, KEY_FILE_PATH)
-    await backend.start_server()
+    # Log configuration (without sensitive data)
+    logger.info("🚀 Starting Linguava Backend")
+    logger.info(f"📋 Project ID: {PROJECT_ID}")
+    logger.info(f"🔑 Key File: {KEY_FILE_PATH}")
+    logger.info(f"🌍 Azure Region: {AZURE_SPEECH_REGION}")
+    logger.info(f"🎯 Target Language: {os.getenv('TARGET_LANGUAGE', 'japanese')}")
+    logger.info("=" * 50)
+    
+    try:
+        backend = EnhancedLinguavaBackend(PROJECT_ID, KEY_FILE_PATH, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION)
+        await backend.start_server()
+    except KeyboardInterrupt:
+        logger.info("\n🛑 Server stopped by user")
+    except Exception as e:
+        logger.error(f"\n❌ Server error: {e}")
+        logger.error("Please check your configuration and try again")
 
 if __name__ == "__main__":
     asyncio.run(main())
